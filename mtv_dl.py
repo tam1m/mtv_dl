@@ -68,6 +68,11 @@ Download options:
                                         is expected to be on a new line.
   --series                              Mark the show as series in the nfo file, add season and
                                         episode information.
+  --daily-series                        Implies --series, but instead of guessing season and
+                                        episode information from the title, it will be extracted from
+                                        the startdate the item. Be aware, this also sets season and episode
+                                        information for non series types, since these values are simply
+                                        taken from the startdate of each item.
 
   WARNING: Please be aware that ancient RTMP streams are not supported
            They will not even get listed.
@@ -588,7 +593,12 @@ class Database:
                             start = datetime.fromtimestamp(0, tz=utc_zone) + timedelta(seconds=int(show["start"]))
 
                             duration = timedelta(seconds=self._duration_in_seconds(show["duration"]))
+
                             season, episode = _guess_series_details(title)
+
+                            if not episode and not season:
+                                season, episode = _get_series_details_by_starttime(start)
+
                             yield {
                                 "hash": self._show_hash(channel, topic, title, size, start.replace(tzinfo=None)),
                                 "channel": channel,
@@ -956,14 +966,28 @@ class Downloader:
         file_name: str,
         file_extension: str,
         media_type: str,
+        daily_series_mode: bool,
     ) -> Union[Literal[False], Path]:
         posix_target = target.as_posix()
         if "{ext}" not in posix_target:
             posix_target += "{ext}"
 
         escaped_show_details = {k: escape_path(str(v)) for k, v in self.show.items()}
-        escaped_show_details["season"] = "00" if self.show["season"] is None else f"{self.show['season']:02d}"
-        escaped_show_details["episode"] = "00" if self.show["episode"] is None else f"{self.show['episode']:02d}"
+        escaped_show_details["season"] = (
+            "00"
+            if self.show["season"] is None
+            else f"{self.show['season']:04d}"
+            if daily_series_mode
+            else f"{self.show['season']:02d}"
+        )
+        escaped_show_details["episode"] = (
+            "00"
+            if self.show["episode"] is None
+            else f"{self.show['episode']:04d}"
+            if daily_series_mode
+            else f"{self.show['episode']:02d}"
+        )
+
         destination_file_path = Path(
             posix_target.format(
                 dir=cwd,
@@ -1127,6 +1151,7 @@ class Downloader:
         set_file_modification_date: bool = False,
         create_strm_files: bool = False,
         series_mode: bool = False,
+        daily_series_mode: bool = False,
     ) -> Optional[Path]:
         temp_path = Path(tempfile.mkdtemp(prefix=".tmp"))
         try:
@@ -1162,7 +1187,7 @@ class Downloader:
 
             if show_file_extension in (".mp4", ".flv", ".mp3", ".strm"):
                 final_show_file = self._move_to_user_target(
-                    show_file_path, cwd, target, show_file_name, show_file_extension, "show"
+                    show_file_path, cwd, target, show_file_name, show_file_extension, "show", daily_series_mode
                 )
                 if not final_show_file:
                     return None
@@ -1173,7 +1198,9 @@ class Downloader:
                     ts_file_path = self._download_hls_target(m3u8_segments, temp_path, show_url, quality)
                 else:
                     ts_file_path = self._download_m3u8_target(m3u8_segments, temp_path)
-                final_show_file = self._move_to_user_target(ts_file_path, cwd, target, show_file_name, ".ts", "show")
+                final_show_file = self._move_to_user_target(
+                    ts_file_path, cwd, target, show_file_name, ".ts", "show", daily_series_mode
+                )
                 if not final_show_file:
                     return None
 
@@ -1185,7 +1212,9 @@ class Downloader:
                 logger.debug("Downloading subtitles for %s from %r.", self.label, self.show["url_subtitles"])
                 subtitles_xml_path = list(self._download_files(temp_path, [self.show["url_subtitles"]]))[0]
                 subtitles_srt_path = self._convert_subtitles_xml_to_srt(subtitles_xml_path)
-                self._move_to_user_target(subtitles_srt_path, cwd, target, show_file_name, ".srt", "subtitles")
+                self._move_to_user_target(
+                    subtitles_srt_path, cwd, target, show_file_name, ".srt", "subtitles", daily_series_mode
+                )
 
             if include_nfo:
                 root_node = "movie" if not series_mode else "episodedetails"
@@ -1201,15 +1230,20 @@ class Downloader:
                     Et.SubElement(nfo_movie, "aired").text = self.show["start"].isoformat()
                 Et.SubElement(nfo_movie, "country").text = self.show["region"]
                 if series_mode and self.show["season"] is not None and self.show["episode"] is not None:
-                    Et.SubElement(nfo_movie, "season").text = str(self.show["season"])
-                    Et.SubElement(nfo_movie, "episode").text = str(self.show["episode"])
+                    Et.SubElement(nfo_movie, "showtitle").text = str(self.show["topic"])
+                    Et.SubElement(nfo_movie, "season").text = (
+                        f"{self.show['season']:02d}" if not daily_series_mode else f"{self.show['season']:04d}"
+                    )
+                    Et.SubElement(nfo_movie, "episode").text = (
+                        f"{self.show['episode']:02d}" if not daily_series_mode else f"{self.show['episode']:04d}"
+                    )
 
                 with NamedTemporaryFile(mode="wb", prefix=".tmp", dir=temp_path, delete=False) as out_fh:
                     nfo_path = Path(temp_path) / out_fh.name
                     out_fh.write(Et.tostring(nfo_movie, xml_declaration=True, encoding="UTF-8"))
 
                 nfo_path.chmod(0o644)
-                self._move_to_user_target(nfo_path, cwd, target, show_file_name, ".nfo", "nfo")
+                self._move_to_user_target(nfo_path, cwd, target, show_file_name, ".nfo", "nfo", daily_series_mode)
 
             return final_show_file
 
@@ -1315,6 +1349,15 @@ def _guess_series_details(title: str, manual_season: int = 1) -> Tuple[Optional[
         m = pattern.search(title)
         if m is not None:
             return manual_season, int(m.group(1))
+
+    return None, None
+
+
+def _get_series_details_by_starttime(starttime: datetime) -> Tuple[Optional[int], Optional[int]]:
+    season = starttime.strftime("%Y") or None
+    episode = starttime.strftime("%m") + starttime.strftime("%d") or None
+    if season and episode:
+        return int(season), int(episode)
 
     return None, None
 
@@ -1507,7 +1550,8 @@ def main() -> None:
                                 include_nfo=not arguments["--no-nfo"],
                                 set_file_modification_date=arguments["--set-file-mod-time"],
                                 create_strm_files=arguments["--strm"],
-                                series_mode=arguments["--series"],
+                                series_mode=arguments["--series"] or arguments["--daily-series"],
+                                daily_series_mode=arguments["--daily-series"],
                             )
                             if downloaded_file:
                                 showlist.add_to_downloaded(item)
