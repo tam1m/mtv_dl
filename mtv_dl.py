@@ -1237,6 +1237,8 @@ class Downloader:
                     Et.SubElement(nfo_movie, "episode").text = (
                         f"{self.show['episode']:02d}" if not daily_series_mode else f"{self.show['episode']:04d}"
                     )
+                if not sys.version_info < (3, 9):
+                    Et.indent(nfo_movie)
 
                 with NamedTemporaryFile(mode="wb", prefix=".tmp", dir=temp_path, delete=False) as out_fh:
                     nfo_path = Path(temp_path) / out_fh.name
